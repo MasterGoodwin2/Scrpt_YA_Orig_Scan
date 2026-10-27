@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Scrpt_YA_Orig_Scan
 // @namespace    https://github.com/MasterGoodwin2/Scrpt_YA_Orig_Scan
-// @version      1.0.0
-// @description  Яндекс.Архив (yandex.ru, ya.ru): автоматически сохраняет оригинальный скан ТЕКУЩЕЙ страницы одним JPG-файлом в папку загрузок.
+// @version      1.1.0
+// @description  Яндекс.Архив (yandex.ru, ya.ru): автоматически сохраняет оригинальный скан ТЕКУЩЕЙ страницы одним JPG-файлом (сжатым до качества 60%) в папку загрузок.
 // @author       MasterGoodwin2
 // @match        https://yandex.ru/archive/*
 // @match        https://ya.ru/archive/*
@@ -24,6 +24,8 @@
   var PANEL_ID = 'scrpt-ya-orig-scan-panel';
   var DONE_PREFIX = 'scrptYaOrigScanDone:';
   var MIN_BYTES = 20000;
+  // Качество JPG при пересохранении: 0.6 = 60% от оригинала.
+  var JPEG_QUALITY = 0.6;
 
   // Страница скана: /archive/catalog/<id>/<номер>
   var LEAF_RE = /^\/archive\/catalog\/([^/?#]+)\/(\d+)\/?$/i;
@@ -181,8 +183,32 @@
     return bytes;
   }
 
-  function saveBlob(bytes, filename) {
-    var blob = new Blob([bytes], { type: 'image/jpeg' });
+  // Пересжатие в JPG с качеством JPEG_QUALITY; размеры в пикселях сохраняются.
+  async function recompressJpeg(bytes) {
+    var source = new Blob([bytes]);
+    var bitmap = await createImageBitmap(source);
+    try {
+      var canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      var ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Canvas недоступен.');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(bitmap, 0, 0);
+      var blob = await new Promise(function (resolve) {
+        canvas.toBlob(resolve, 'image/jpeg', JPEG_QUALITY);
+      });
+      if (!blob || blob.size < 1000 || blob.type !== 'image/jpeg') {
+        throw new Error('Не удалось закодировать JPG.');
+      }
+      return blob;
+    } finally {
+      if (bitmap.close) bitmap.close();
+    }
+  }
+
+  function saveBlob(blob, filename) {
     var objectUrl = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = objectUrl;
@@ -193,6 +219,10 @@
     a.click();
     document.body.removeChild(a);
     setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 10000);
+  }
+
+  function formatSize(n) {
+    return n >= 1048576 ? (n / 1048576).toFixed(1) + ' МБ' : Math.round(n / 1024) + ' КБ';
   }
 
   // ---------- Панель статуса ----------
@@ -268,10 +298,22 @@
 
       var filename = buildFilename(info, leaf.page);
       var bytes = await fetchOriginal(info.nodeId);
-      saveBlob(bytes, filename);
+      var outBlob;
+      var note;
+      try {
+        setStatus('Страница ' + leaf.page + ': сжимаю JPG до качества 60%…');
+        outBlob = await recompressJpeg(bytes);
+        note = formatSize(bytes.length) + ' → ' + formatSize(outBlob.size);
+      } catch (compressError) {
+        // Если пересжатие невозможно (например, слишком большой снимок) — сохраняем оригинал.
+        console.warn(LOG, 'Пересжатие не удалось, сохраняю оригинал:', compressError);
+        outBlob = new Blob([bytes], { type: 'image/jpeg' });
+        note = 'сжатие не удалось, сохранён оригинал ' + formatSize(bytes.length);
+      }
+      saveBlob(outBlob, filename);
       safeSet(doneKey, filename);
       busy = false;
-      setStatus('Сохранено: ' + filename, 'ok');
+      setStatus('Сохранено: ' + filename + ' (' + note + ')', 'ok');
     } catch (e) {
       busy = false;
       safeRemove(doneKey);
