@@ -1,0 +1,318 @@
+// ==UserScript==
+// @name         Scrpt_YA_Orig_Scan
+// @namespace    https://github.com/MasterGoodwin2/Scrpt_YA_Orig_Scan
+// @version      1.0.0
+// @description  Яндекс.Архив (yandex.ru, ya.ru): автоматически сохраняет оригинальный скан ТЕКУЩЕЙ страницы одним JPG-файлом в папку загрузок.
+// @author       MasterGoodwin2
+// @match        https://yandex.ru/archive/*
+// @match        https://ya.ru/archive/*
+// @run-at       document-idle
+// @grant        none
+// @license      MIT
+// @homepageURL  https://github.com/MasterGoodwin2/Scrpt_YA_Orig_Scan
+// ==/UserScript==
+
+/*
+ * Основан на логике расширения Archive Original Downloader 1.8.8-beta
+ * (https://github.com/JPS-Codex/archive-original-downloader),
+ * оставлена только часть для Яндекс.Архива и одиночное скачивание.
+ */
+(function () {
+  'use strict';
+
+  var LOG = '[Scrpt_YA_Orig_Scan]';
+  var PANEL_ID = 'scrpt-ya-orig-scan-panel';
+  var DONE_PREFIX = 'scrptYaOrigScanDone:';
+  var MIN_BYTES = 20000;
+
+  // Страница скана: /archive/catalog/<id>/<номер>
+  var LEAF_RE = /^\/archive\/catalog\/([^/?#]+)\/(\d+)\/?$/i;
+
+  var busy = false;
+  var lastHandledUrl = null;
+
+  // ---------- Вспомогательное ----------
+
+  function isSupportedHost() {
+    return /^(www\.)?(yandex\.ru|ya\.ru)$/i.test(location.hostname);
+  }
+
+  function parseLeaf(urlString) {
+    try {
+      var u = new URL(urlString, location.href);
+      if (!/^(www\.)?(yandex\.ru|ya\.ru)$/i.test(u.hostname)) return null;
+      var m = u.pathname.match(LEAF_RE);
+      if (!m) return null;
+      return { id: m[1], page: parseInt(m[2], 10), url: u.origin + u.pathname };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function sanitize(value) {
+    return String(value || '')
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+      .replace(/\s+/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '');
+  }
+
+  function safeGet(key) {
+    try { return sessionStorage.getItem(key); } catch (e) { return null; }
+  }
+  function safeSet(key, value) {
+    try { sessionStorage.setItem(key, value); } catch (e) {}
+  }
+  function safeRemove(key) {
+    try { sessionStorage.removeItem(key); } catch (e) {}
+  }
+
+  function parseNextData(html) {
+    var m = html.match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+    if (!m || !m[1]) return null;
+    try { return JSON.parse(m[1]); } catch (e) { return null; }
+  }
+
+  function looksLikeHtml(bytes) {
+    var s = '';
+    var n = Math.min(bytes.length, 256);
+    for (var i = 0; i < n; i += 1) s += String.fromCharCode(bytes[i]);
+    return /^\s*(<!doctype html|<html|<head|<body)/i.test(s);
+  }
+
+  function isJpeg(bytes) {
+    return bytes.length > 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
+  }
+
+  // ---------- Получение данных страницы ----------
+
+  // Берём свежий HTML именно той страницы, которая открыта сейчас
+  // (на SPA-переходах __NEXT_DATA__ в DOM может быть устаревшим).
+  async function loadPageInfo(leaf) {
+    var response = await fetch(leaf.url, { credentials: 'include' });
+    if (!response.ok) {
+      throw new Error('Не удалось загрузить страницу, HTTP ' + response.status + '.');
+    }
+    var html = await response.text();
+    var data = parseNextData(html);
+    var props = data && data.props ? data.props.pageProps : null;
+    var node = props && props.currentNode ? props.currentNode : null;
+    if (!node || !node.id) {
+      throw new Error('Не найден идентификатор скана на странице.');
+    }
+    return {
+      nodeId: node.id,
+      breadcrumbs: props.breadcrumbs || [],
+      html: html
+    };
+  }
+
+  function buildFilename(info, pageNumber) {
+    var crumbs = info.breadcrumbs || [];
+    function find(type) {
+      for (var i = 0; i < crumbs.length; i += 1) {
+        if (crumbs[i].type === type) return crumbs[i];
+      }
+      return null;
+    }
+    var archive = find('Archive');
+    var fund = find('Fund');
+    var inventory = find('Inventory');
+    var file = find('File');
+    var opisMatch = inventory && String(inventory.code || '').match(/\d+/);
+    var padded = String(pageNumber).padStart(4, '0');
+
+    var parts = [];
+    if (fund && fund.code) parts.push(String(fund.code).trim());
+    if (opisMatch) parts.push(opisMatch[0]);
+    if (file && file.code) parts.push(String(file.code).trim());
+
+    if (parts.length >= 2) {
+      var prefix = archive && archive.name ? sanitize(archive.name) + '_[ЯА]_' : '';
+      return prefix + sanitize(parts.join('-') + '-' + padded) + '.jpg';
+    }
+    return 'YA_archive_' + sanitize(info.nodeId) + '_' + padded + '.jpg';
+  }
+
+  // ---------- Загрузка оригинала ----------
+
+  function validateBytes(bytes, contentType) {
+    if (contentType && contentType.indexOf('image/') !== 0) {
+      throw new Error('Сервер вернул не изображение (' + contentType + ').');
+    }
+    if (looksLikeHtml(bytes)) {
+      throw new Error('Сервер вернул HTML вместо скана.');
+    }
+    if (bytes.length < MIN_BYTES) {
+      throw new Error('Получен слишком маленький файл (' + bytes.length + ' байт), вероятно превью.');
+    }
+    return bytes;
+  }
+
+  async function fetchOriginal(nodeId) {
+    var grantResponse = await fetch('/archive/api/image-grant', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ nodeId: nodeId, type: 'original' })
+    });
+    if (!grantResponse.ok) {
+      throw new Error('image-grant: HTTP ' + grantResponse.status + '.');
+    }
+    var grant = await grantResponse.json();
+    if (!grant || !grant.url || !grant.token) {
+      throw new Error('image-grant: некорректный ответ сервера.');
+    }
+
+    var imageUrl = new URL(grant.url, location.origin).href;
+    var imageResponse = await fetch(imageUrl, {
+      headers: { 'X-Archive-Image-Token': grant.token },
+      credentials: 'include'
+    });
+    if (!imageResponse.ok) {
+      throw new Error('Загрузка оригинала: HTTP ' + imageResponse.status + '.');
+    }
+    var contentType = String(imageResponse.headers.get('content-type') || '').toLowerCase();
+    var bytes = new Uint8Array(await imageResponse.arrayBuffer());
+    validateBytes(bytes, contentType);
+    if (!isJpeg(bytes)) {
+      console.warn(LOG, 'Файл не начинается с JPEG-сигнатуры, но сохраняется как .jpg');
+    }
+    return bytes;
+  }
+
+  function saveBlob(bytes, filename) {
+    var blob = new Blob([bytes], { type: 'image/jpeg' });
+    var objectUrl = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = filename;
+    a.rel = 'noopener';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 10000);
+  }
+
+  // ---------- Панель статуса ----------
+
+  function ensurePanel() {
+    var panel = document.getElementById(PANEL_ID);
+    if (panel) return panel;
+    panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.style.cssText = [
+      'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483647',
+      'max-width:340px', 'padding:10px 12px', 'border-radius:10px',
+      'background:#1f2937', 'color:#fff', 'font:13px/1.4 Arial,sans-serif',
+      'box-shadow:0 4px 16px rgba(0,0,0,.3)'
+    ].join(';');
+
+    var text = document.createElement('div');
+    text.className = 'scrpt-text';
+    panel.appendChild(text);
+
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'scrpt-btn';
+    btn.textContent = 'Скачать скан ещё раз';
+    btn.style.cssText = 'margin-top:8px;padding:5px 10px;border:0;border-radius:6px;' +
+      'background:#fc0;color:#000;cursor:pointer;font:600 12px Arial,sans-serif';
+    btn.addEventListener('click', function () { run(true); });
+    panel.appendChild(btn);
+
+    document.body.appendChild(panel);
+    return panel;
+  }
+
+  function setStatus(message, kind) {
+    var panel = ensurePanel();
+    var text = panel.querySelector('.scrpt-text');
+    text.textContent = message;
+    panel.style.background = kind === 'error' ? '#991b1b' : kind === 'ok' ? '#166534' : '#1f2937';
+    var btn = panel.querySelector('.scrpt-btn');
+    btn.disabled = busy;
+    btn.style.opacity = busy ? '0.5' : '1';
+  }
+
+  function hidePanel() {
+    var panel = document.getElementById(PANEL_ID);
+    if (panel && panel.parentNode) panel.parentNode.removeChild(panel);
+  }
+
+  // ---------- Основной сценарий ----------
+
+  // force=true — повторное скачивание по кнопке.
+  async function run(force) {
+    var leaf = parseLeaf(location.href);
+    if (!leaf) {
+      hidePanel();
+      return;
+    }
+    if (busy) return;
+
+    var doneKey = DONE_PREFIX + leaf.url;
+    if (!force && safeGet(doneKey)) {
+      setStatus('Скан страницы ' + leaf.page + ' уже сохранён (' + safeGet(doneKey) + ').', 'ok');
+      return;
+    }
+
+    busy = true;
+    setStatus('Страница ' + leaf.page + ': получаю оригинал…');
+    try {
+      var info = await loadPageInfo(leaf);
+      // Пользователь мог уйти на другую страницу, пока шёл запрос.
+      var now = parseLeaf(location.href);
+      if (!now || now.url !== leaf.url) return;
+
+      var filename = buildFilename(info, leaf.page);
+      var bytes = await fetchOriginal(info.nodeId);
+      saveBlob(bytes, filename);
+      safeSet(doneKey, filename);
+      busy = false;
+      setStatus('Сохранено: ' + filename, 'ok');
+    } catch (e) {
+      busy = false;
+      safeRemove(doneKey);
+      console.error(LOG, e);
+      setStatus('Ошибка: ' + (e && e.message ? e.message : e), 'error');
+    } finally {
+      busy = false;
+    }
+  }
+
+  // ---------- Отслеживание страницы (в т. ч. SPA-переходы) ----------
+
+  function onLocationMaybeChanged() {
+    var leaf = parseLeaf(location.href);
+    if (!leaf) {
+      lastHandledUrl = null;
+      hidePanel();
+      return;
+    }
+    if (leaf.url === lastHandledUrl) return;
+    lastHandledUrl = leaf.url;
+    run(false);
+  }
+
+  function init() {
+    if (!isSupportedHost()) return;
+
+    ['pushState', 'replaceState'].forEach(function (method) {
+      var original = history[method];
+      history[method] = function () {
+        var result = original.apply(this, arguments);
+        setTimeout(onLocationMaybeChanged, 0);
+        return result;
+      };
+    });
+    window.addEventListener('popstate', onLocationMaybeChanged);
+    // Подстраховка на случай навигации, не прошедшей через History API.
+    setInterval(onLocationMaybeChanged, 1000);
+
+    onLocationMaybeChanged();
+  }
+
+  init();
+})();
