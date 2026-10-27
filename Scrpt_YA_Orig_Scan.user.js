@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Scrpt_YA_Orig_Scan
 // @namespace    https://github.com/MasterGoodwin2/Scrpt_YA_Orig_Scan
-// @version      1.1.0
+// @version      1.2.0
 // @description  Яндекс.Архив (yandex.ru, ya.ru): автоматически сохраняет оригинальный скан ТЕКУЩЕЙ страницы одним JPG-файлом (сжатым до качества 60%) в папку загрузок.
 // @author       MasterGoodwin2
 // @match        https://yandex.ru/archive/*
@@ -24,6 +24,8 @@
   var PANEL_ID = 'scrpt-ya-orig-scan-panel';
   var DONE_PREFIX = 'scrptYaOrigScanDone:';
   var MIN_BYTES = 20000;
+  // Максимальное ожидание полной загрузки графики страницы (мс).
+  var GRAPHICS_TIMEOUT_MS = 45000;
   // Качество JPG при пересохранении: 0.6 = 60% от оригинала.
   var JPEG_QUALITY = 0.6;
 
@@ -134,6 +136,67 @@
       return prefix + sanitize(parts.join('-') + '-' + padded) + '.jpg';
     }
     return 'YA_archive_' + sanitize(info.nodeId) + '_' + padded + '.jpg';
+  }
+
+  // ---------- Ожидание загрузки графики ----------
+
+  function isVisibleBox(el) {
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+
+  // true, если на странице есть крупное, полностью загруженное изображение (скан)
+  // и ни одна видимая картинка не находится в процессе загрузки.
+  function graphicsState() {
+    var imgs = Array.prototype.slice.call(document.images);
+    var pending = 0;
+    var mainReady = false;
+    imgs.forEach(function (img) {
+      var src = img.currentSrc || img.getAttribute('src');
+      if (!src || !isVisibleBox(img)) return;
+      var r = img.getBoundingClientRect();
+      var inViewport = r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
+      if (!img.complete) {
+        if (inViewport) pending += 1;
+        return;
+      }
+      if (img.naturalWidth === 0) return; // битая картинка не блокирует ожидание
+      if (r.width >= 200 && r.height >= 200) mainReady = true;
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('canvas'), function (c) {
+      if (c.width >= 200 && c.height >= 200 && isVisibleBox(c)) mainReady = true;
+    });
+    return { pending: pending, mainReady: mainReady };
+  }
+
+  // Ждём полной загрузки документа и графики; возвращает true, если дождались,
+  // false — если истёк таймаут (тогда всё равно продолжаем). Прерывается при смене страницы.
+  async function waitForGraphics(leaf) {
+    var started = Date.now();
+    var stable = 0;
+
+    if (document.readyState !== 'complete') {
+      await new Promise(function (resolve) {
+        var done = false;
+        function finish() { if (!done) { done = true; resolve(); } }
+        window.addEventListener('load', finish, { once: true });
+        setTimeout(finish, GRAPHICS_TIMEOUT_MS);
+      });
+    }
+
+    while (Date.now() - started < GRAPHICS_TIMEOUT_MS) {
+      var now = parseLeaf(location.href);
+      if (!now || now.url !== leaf.url) return false;
+      var st = graphicsState();
+      if (st.pending === 0 && st.mainReady) {
+        stable += 1;
+        if (stable >= 3) return true; // ~0,75 с без изменений
+      } else {
+        stable = 0;
+      }
+      await new Promise(function (resolve) { setTimeout(resolve, 250); });
+    }
+    return false;
   }
 
   // ---------- Загрузка оригинала ----------
@@ -289,8 +352,15 @@
     }
 
     busy = true;
-    setStatus('Страница ' + leaf.page + ': получаю оригинал…');
+    setStatus('Страница ' + leaf.page + ': жду полной загрузки графики…');
     try {
+      var graphicsOk = await waitForGraphics(leaf);
+      var afterWait = parseLeaf(location.href);
+      if (!afterWait || afterWait.url !== leaf.url) return;
+      if (!graphicsOk) {
+        console.warn(LOG, 'Графика не загрузилась за ' + GRAPHICS_TIMEOUT_MS + ' мс, продолжаю.');
+      }
+      setStatus('Страница ' + leaf.page + ': получаю оригинал…');
       var info = await loadPageInfo(leaf);
       // Пользователь мог уйти на другую страницу, пока шёл запрос.
       var now = parseLeaf(location.href);
