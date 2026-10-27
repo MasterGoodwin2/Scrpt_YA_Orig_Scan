@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Scrpt_YA_Orig_Scan
 // @namespace    https://github.com/MasterGoodwin2/Scrpt_YA_Orig_Scan
-// @version      1.2.0
-// @description  Яндекс.Архив (yandex.ru, ya.ru): автоматически сохраняет оригинальный скан ТЕКУЩЕЙ страницы одним JPG-файлом (сжатым до качества 60%) в папку загрузок.
+// @version      1.3.0
+// @description  Яндекс.Архив (yandex.ru, ya.ru): автоматически сохраняет оригинальный скан ТЕКУЩЕЙ страницы одним JPG-файлом (сжатым до качества 40%) в папку загрузок.
 // @author       MasterGoodwin2
 // @match        https://yandex.ru/archive/*
 // @match        https://ya.ru/archive/*
@@ -26,8 +26,8 @@
   var MIN_BYTES = 20000;
   // Максимальное ожидание полной загрузки графики страницы (мс).
   var GRAPHICS_TIMEOUT_MS = 45000;
-  // Качество JPG при пересохранении: 0.6 = 60% от оригинала.
-  var JPEG_QUALITY = 0.6;
+  // Качество JPG при пересохранении: 0.4 = 40% от оригинала.
+  var JPEG_QUALITY = 0.4;
 
   // Страница скана: /archive/catalog/<id>/<номер>
   var LEAF_RE = /^\/archive\/catalog\/([^/?#]+)\/(\d+)\/?$/i;
@@ -371,7 +371,7 @@
       var outBlob;
       var note;
       try {
-        setStatus('Страница ' + leaf.page + ': сжимаю JPG до качества 60%…');
+        setStatus('Страница ' + leaf.page + ': сжимаю JPG до качества 40%…');
         outBlob = await recompressJpeg(bytes);
         note = formatSize(bytes.length) + ' → ' + formatSize(outBlob.size);
       } catch (compressError) {
